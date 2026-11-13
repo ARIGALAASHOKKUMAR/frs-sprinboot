@@ -68,7 +68,7 @@ public class DatabaseConfig {
 
         String password = e.getOrDefault(
                 "PGPASSWORD",
-                "Ashok@786"
+                ""
         );
 
         // Optional DATABASE_URL support
