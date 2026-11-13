@@ -1,238 +1,313 @@
+
 package com.frs.backend.service.impl;
 
+import com.frs.backend.dto.FaceImageDto;
+import com.frs.backend.entity.FaceTemplateEntity;
+import com.frs.backend.repository.FaceTemplateRepository;
 import com.frs.backend.service.FaceDescriptorService;
+import com.frs.backend.service.FaceService;
 
-import jakarta.annotation.PostConstruct;
-
-import nu.pattern.OpenCV;
-
-import org.opencv.core.*;
-import org.opencv.objdetect.FaceDetectorYN;
-import org.opencv.objdetect.FaceRecognizerSF;
-
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 
-import java.io.InputStream;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Base64;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 @Service
-public class FaceServiceImpl implements FaceDescriptorService {
+public class FaceServiceImpl implements FaceService {
 
-    private FaceDetectorYN detector;
-    private FaceRecognizerSF recognizer;
+    // OpenCV SFace cosine similarity threshold.
+    private static final double MATCH_THRESHOLD = 0.363;
 
-    private volatile boolean loaded = false;
+    private final FaceTemplateRepository templates;
+    private final FaceDescriptorService descriptors;
 
-    @PostConstruct
-    public void load() {
+    public FaceServiceImpl(
+            FaceTemplateRepository templates,
+            FaceDescriptorService descriptors
+    ) {
+        this.templates = templates;
+        this.descriptors = descriptors;
+    }
+
+    // --------------------------------------------------
+    // HEALTH CHECK
+    // --------------------------------------------------
+
+    @Override
+    public ResponseEntity<Map<String, Object>> health() {
+
+        Map<String, Object> response = new LinkedHashMap<>();
+
+        response.put("status", "UP");
+        response.put("modelsLoaded", descriptors.loaded());
+        response.put("faceRegistered", templates.existsAny());
+        response.put("message", descriptors.loaded()
+                ? "Face recognition service is ready"
+                : "Face recognition models are not loaded");
+
+        return ResponseEntity.ok(response);
+    }
+
+    // --------------------------------------------------
+    // FACE REGISTRATION STATUS
+    // --------------------------------------------------
+
+    @Override
+    public ResponseEntity<Map<String, Object>> status(
+            String employeeId
+    ) {
+
+        Map<String, Object> response = new LinkedHashMap<>();
+
+        if (employeeId == null || employeeId.isBlank()) {
+            response.put("success", false);
+            response.put("message", "Employee ID is required");
+
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        return templates.findById(employeeId)
+                .map(template -> {
+
+                    response.put("success", true);
+                    response.put("registered", true);
+                    response.put("employeeId", employeeId);
+                    response.put("registeredAt",
+                            template.getRegisteredAt());
+
+                    response.put("message", "Face already registered");
+
+                    return ResponseEntity.ok(response);
+                })
+                .orElseGet(() -> {
+
+                    response.put("success", true);
+                    response.put("registered", false);
+                    response.put("employeeId", employeeId);
+                    response.put("message", "Face not registered");
+
+                    return ResponseEntity.ok(response);
+                });
+    }
+
+    // --------------------------------------------------
+    // REGISTER FACE
+    // --------------------------------------------------
+
+    @Override
+    public ResponseEntity<Map<String, Object>> register(
+            String employeeId,
+            FaceImageDto body
+    ) {
+
+        Map<String, Object> response = new LinkedHashMap<>();
 
         try {
 
-            OpenCV.loadLocally();
+            if (employeeId == null || employeeId.isBlank()) {
+                return error(
+                        HttpStatus.BAD_REQUEST,
+                        "Employee ID is required"
+                );
+            }
 
-            String detectorPath = extractModel(
-                "/models/face_detection_yunet_2023mar.onnx"
+            if (body == null || body.image() == null
+                    || body.image().isBlank()) {
+                return error(
+                        HttpStatus.BAD_REQUEST,
+                        "Face image is required"
+                );
+            }
+
+            if (!descriptors.loaded()) {
+                return error(
+                        HttpStatus.SERVICE_UNAVAILABLE,
+                        "Face recognition models are not loaded"
+                );
+            }
+
+            // Generate SFace descriptor.
+            double[] descriptor = descriptors.descriptor(body.image());
+
+            if (descriptor == null || descriptor.length != 128) {
+                return error(
+                        HttpStatus.INTERNAL_SERVER_ERROR,
+                        "Invalid face descriptor generated"
+                );
+            }
+
+            // Convert double[] to PostgreSQL Double[].
+            Double[] storedDescriptor = Arrays.stream(descriptor)
+                    .boxed()
+                    .toArray(Double[]::new);
+
+            // Save face template.
+            FaceTemplateEntity entity = new FaceTemplateEntity(
+                    employeeId,
+                    storedDescriptor,
+                    Instant.now()
             );
 
-            String recognizerPath = extractModel(
-                "/models/face_recognition_sface_2021dec.onnx"
-            );
+            templates.save(entity);
 
-            detector = FaceDetectorYN.create(
-                detectorPath,
-                "",
-                new Size(320, 320),
-                0.9f,
-                0.3f,
-                5000
-            );
+            response.put("success", true);
+            response.put("registered", true);
+            response.put("employeeId", employeeId);
+            response.put("registeredAt", entity.getRegisteredAt());
+            response.put("message", "Face registered successfully");
 
-            recognizer = FaceRecognizerSF.create(
-                recognizerPath,
-                ""
-            );
+            return ResponseEntity.ok(response);
 
-            loaded = detector != null && recognizer != null;
+        } catch (IllegalArgumentException e) {
 
-            System.out.println(
-                "Face recognition models loaded: " + loaded
+            return error(
+                    HttpStatus.BAD_REQUEST,
+                    e.getMessage()
             );
 
         } catch (Exception e) {
 
-            loaded = false;
+            e.printStackTrace();
 
-            System.err.println(
-                "Face model initialization failed: " + e.getMessage()
+            return error(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Face registration failed"
             );
+        }
+    }
+
+    // --------------------------------------------------
+    // COMPARE FACE
+    // --------------------------------------------------
+
+    @Override
+    public ResponseEntity<Map<String, Object>> compare(
+            String employeeId,
+            FaceImageDto body
+    ) {
+
+        try {
+
+            if (employeeId == null || employeeId.isBlank()) {
+                return error(
+                        HttpStatus.BAD_REQUEST,
+                        "Employee ID is required"
+                );
+            }
+
+            if (body == null || body.image() == null
+                    || body.image().isBlank()) {
+                return error(
+                        HttpStatus.BAD_REQUEST,
+                        "Face image is required"
+                );
+            }
+
+            if (!descriptors.loaded()) {
+                return error(
+                        HttpStatus.SERVICE_UNAVAILABLE,
+                        "Face recognition models are not loaded"
+                );
+            }
+
+            // Get registered face.
+            FaceTemplateEntity template = templates.findById(employeeId)
+                    .orElse(null);
+
+            if (template == null) {
+                return error(
+                        HttpStatus.NOT_FOUND,
+                        "Face not registered for this employee"
+                );
+            }
+
+            Double[] stored = template.getDescriptor();
+
+            if (stored == null || stored.length != 128) {
+                return error(
+                        HttpStatus.INTERNAL_SERVER_ERROR,
+                        "Stored face descriptor is invalid"
+                );
+            }
+
+            // Convert stored descriptor.
+            double[] storedDescriptor = Arrays.stream(stored)
+                    .mapToDouble(Double::doubleValue)
+                    .toArray();
+
+            // Generate captured face descriptor.
+            double[] capturedDescriptor =
+                    descriptors.descriptor(body.image());
+
+            if (capturedDescriptor == null
+                    || capturedDescriptor.length != 128) {
+                return error(
+                        HttpStatus.BAD_REQUEST,
+                        "Unable to generate face descriptor"
+                );
+            }
+
+            // Calculate cosine similarity.
+            double similarity =
+                    FaceDescriptorService.cosineSimilarity(
+                            storedDescriptor,
+                            capturedDescriptor
+                    );
+
+            boolean matched = similarity >= MATCH_THRESHOLD;
+
+            Map<String, Object> response = new LinkedHashMap<>();
+
+            response.put("success", true);
+            response.put("matched", matched);
+            response.put("employeeId", employeeId);
+            response.put("similarity", similarity);
+            response.put("threshold", MATCH_THRESHOLD);
+
+            response.put(
+                    "message",
+                    matched ? "Face matched" : "Face not match"
+            );
+
+            return ResponseEntity.ok(response);
+
+        } catch (IllegalArgumentException e) {
+
+            return error(
+                    HttpStatus.BAD_REQUEST,
+                    e.getMessage()
+            );
+
+        } catch (Exception e) {
 
             e.printStackTrace();
+
+            return error(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Face comparison failed"
+            );
         }
     }
 
-    private String extractModel(String resourcePath) throws IOException {
+    // --------------------------------------------------
+    // COMMON ERROR RESPONSE
+    // --------------------------------------------------
 
-        try (InputStream input =
-                 getClass().getResourceAsStream(resourcePath)) {
+    private ResponseEntity<Map<String, Object>> error(
+            HttpStatus status,
+            String message
+    ) {
 
-            if (input == null) {
-                throw new IOException(
-                    "Model not found: " + resourcePath
-                );
-            }
+        Map<String, Object> response = new LinkedHashMap<>();
 
-            String fileName = resourcePath.substring(
-                resourcePath.lastIndexOf('/') + 1
-            );
+        response.put("success", false);
+        response.put("matched", false);
+        response.put("message", message);
 
-            Path tempFile = Files.createTempFile(
-                "frs-", "-" + fileName
-            );
-
-            Files.copy(
-                input,
-                tempFile,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING
-            );
-
-            tempFile.toFile().deleteOnExit();
-
-            return tempFile.toAbsolutePath().toString();
-        }
-    }
-
-    @Override
-    public boolean loaded() {
-        return loaded;
-    }
-
-    @Override
-    public double[] descriptor(String input) throws Exception {
-
-        if (!loaded) {
-            throw new IllegalStateException(
-                "Face recognition models are not loaded"
-            );
-        }
-
-        if (input == null || input.isBlank()) {
-            throw new IllegalArgumentException(
-                "Face image is required"
-            );
-        }
-
-        String base64 = input.replaceFirst(
-            "^data:image/[A-Za-z0-9.+-]+;base64,",
-            ""
-        );
-
-        byte[] imageBytes;
-
-        try {
-            imageBytes = Base64.getDecoder().decode(base64);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("Invalid image data");
-        }
-
-        if (imageBytes.length == 0) {
-            throw new IllegalArgumentException("Invalid image data");
-        }
-
-        Mat image = org.opencv.imgcodecs.Imgcodecs.imdecode(
-            new MatOfByte(imageBytes),
-            org.opencv.imgcodecs.Imgcodecs.IMREAD_COLOR
-        );
-
-        if (image.empty()) {
-            throw new IllegalArgumentException(
-                "Unable to read face image"
-            );
-        }
-
-        try {
-
-            detector.setInputSize(
-                new Size(image.cols(), image.rows())
-            );
-
-            Mat faces = new Mat();
-
-            detector.detect(image, faces);
-
-            if (faces.empty() || faces.rows() == 0) {
-                throw new IllegalArgumentException(
-                    "No face detected. Please capture a clear face image."
-                );
-            }
-
-            // Select the face with the highest detection confidence.
-            int bestIndex = 0;
-            double bestConfidence = -1;
-
-            for (int i = 0; i < faces.rows(); i++) {
-
-                double[] values = faces.get(i, 0);
-
-                if (values != null && values.length >= 15) {
-
-                    double confidence = values[14];
-
-                    if (confidence > bestConfidence) {
-                        bestConfidence = confidence;
-                        bestIndex = i;
-                    }
-                }
-            }
-
-            Mat face = faces.row(bestIndex);
-
-            Mat alignedFace = new Mat();
-
-            recognizer.alignCrop(
-                image,
-                face,
-                alignedFace
-            );
-
-            Mat feature = new Mat();
-
-            recognizer.feature(
-                alignedFace,
-                feature
-            );
-
-            if (feature.empty()) {
-                throw new IllegalStateException(
-                    "Unable to generate face descriptor"
-                );
-            }
-
-            int total = (int) (feature.total() * feature.channels());
-
-            double[] descriptor = new double[total];
-
-            float[] featureValues = new float[total];
-
-            feature.get(0, 0, featureValues);
-
-            for (int i = 0; i < total; i++) {
-                descriptor[i] = featureValues[i];
-            }
-
-            if (descriptor.length != 128) {
-                throw new IllegalStateException(
-                    "Unexpected face descriptor size: " +
-                    descriptor.length
-                );
-            }
-
-            return descriptor;
-
-        } finally {
-            image.release();
-        }
+        return ResponseEntity.status(status).body(response);
     }
 }
