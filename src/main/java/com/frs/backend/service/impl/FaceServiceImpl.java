@@ -75,35 +75,93 @@ public class FaceServiceImpl implements FaceService {
         }
     }
 
-    @Override
-    public ResponseEntity<Map<String, Object>> compare(String employeeId, FaceImageDto body) {
-        if (!descriptors.loaded()) {
-            return modelUnavailable();
-        }
-        try {
-            var registered = templates.findById(employeeId);
-            if (registered.isEmpty()) {
-                return ResponseEntity.badRequest().body(Map.of("success", false, "matched", false,
-                        "message", "No registered face found. Please register first."));
-            }
-            Double[] storedDescriptor = registered.get().getDescriptor();
-            double[] descriptor = new double[storedDescriptor.length];
-            for (int i = 0; i < storedDescriptor.length; i++) {
-                descriptor[i] = storedDescriptor[i];
-            }
-            double distance = FaceDescriptorService.distance(
-                    descriptor, descriptors.descriptor(Objects.toString(body.image(), null)));
-            boolean matched = distance < MATCH_THRESHOLD;
-            return ResponseEntity.ok(Map.of("success", true,
-                    "matched", matched,
-                    "distance", Math.round(distance * 10000.0) / 10000.0,
-                    "threshold", MATCH_THRESHOLD,
-                    "message", matched ? "Face matched successfully" : "Face does not match"));
-        } catch (Exception exception) {
-            return ResponseEntity.badRequest().body(Map.of("success", false, "matched", false,
-                    "message", Objects.toString(exception.getMessage(), "Face comparison failed")));
-        }
+   
+@Override
+public ResponseEntity<Map<String, Object>> compare(
+        String employeeId, FaceImageDto body) {
+
+    if (!descriptors.loaded()) {
+        return modelUnavailable();
     }
+
+    try {
+        var registered = templates.findById(employeeId);
+
+        if (registered.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "matched", false,
+                    "message", "No registered face found. Please register first."
+            ));
+        }
+
+        Double[] stored = registered.get().getDescriptor();
+
+        if (stored == null || stored.length != 128) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "matched", false,
+                    "message", "Invalid registered face descriptor."
+            ));
+        }
+
+        double[] storedDescriptor = new double[stored.length];
+
+        for (int i = 0; i < stored.length; i++) {
+            if (stored[i] == null || !Double.isFinite(stored[i])) {
+                throw new IllegalArgumentException(
+                        "Invalid value in registered face descriptor.");
+            }
+
+            storedDescriptor[i] = stored[i];
+        }
+
+        double[] capturedDescriptor =
+                descriptors.descriptor(body.image());
+
+        if (capturedDescriptor == null ||
+                capturedDescriptor.length != 128) {
+            throw new IllegalArgumentException(
+                    "Invalid captured face descriptor.");
+        }
+
+        double distance = FaceDescriptorService.distance(
+                storedDescriptor,
+                capturedDescriptor
+        );
+
+        if (!Double.isFinite(distance)) {
+            throw new IllegalArgumentException(
+                    "Invalid face comparison distance.");
+        }
+
+        boolean matched = distance < MATCH_THRESHOLD;
+
+        Map<String, Object> response = new LinkedHashMap<>();
+
+        response.put("success", true);
+        response.put("matched", matched);
+        response.put("distance",
+                Math.round(distance * 10000.0) / 10000.0);
+        response.put("threshold", MATCH_THRESHOLD);
+        response.put("message", matched
+                ? "Face matched successfully"
+                : "Face does not match");
+
+        return ResponseEntity.ok(response);
+
+    } catch (Exception exception) {
+        exception.printStackTrace();
+
+        return ResponseEntity.badRequest().body(Map.of(
+                "success", false,
+                "matched", false,
+                "message", Objects.toString(
+                        exception.getMessage(),
+                        "Face comparison failed")
+        ));
+    }
+}
 
     private static ResponseEntity<Map<String, Object>> modelUnavailable() {
         return ResponseEntity.status(503).body(Map.of(
