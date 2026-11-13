@@ -1,0 +1,10 @@
+package com.frs.backend.security;
+import com.frs.backend.service.AuthService;import jakarta.servlet.*;import jakarta.servlet.http.*;import org.springframework.stereotype.Component;import org.springframework.web.filter.OncePerRequestFilter;import java.io.IOException;import java.util.*;
+@Component public class AuthFilter extends OncePerRequestFilter {
+ private final AuthService auth;public AuthFilter(AuthService auth){this.auth=auth;}
+ @Override protected boolean shouldNotFilter(HttpServletRequest r){return r.getRequestURI().equals("/api/auth/login")||r.getRequestURI().equals("/")||r.getMethod().equalsIgnoreCase("OPTIONS");}
+ @Override protected void doFilterInternal(HttpServletRequest req,HttpServletResponse res,FilterChain chain)throws ServletException,IOException {String authorization=req.getHeader("Authorization"),token=authorization==null?"":authorization.replaceFirst("(?i)^Bearer\\s+","");if(token.isBlank()){json(res,401,"Please sign in again.");return;}List<Map<String,Object>> rows;try{rows=auth.findPrincipal(token);}catch(Exception e){json(res,503,"Unable to verify your session. Check the backend database connection.");return;}if(rows.isEmpty()){json(res,401,"Your session expired. Please sign in again.");return;}req.setAttribute("employeeId",rows.get(0).get("employeeId").toString());req.setAttribute("role",rows.get(0).get("role").toString());req.setAttribute("sessionToken",token);chain.doFilter(req,res);}
+ public static String employee(HttpServletRequest r){return (String)r.getAttribute("employeeId");}public static String role(HttpServletRequest r){return (String)r.getAttribute("role");}
+ public static boolean admin(HttpServletRequest r,HttpServletResponse s)throws IOException{if(!"admin".equals(role(r))){json(s,403,"Administrator access is required.");return false;}return true;}
+ public static void json(HttpServletResponse res,int status,String message)throws IOException{res.setStatus(status);res.setContentType("application/json");res.getWriter().write("{\"success\":false,\"message\":\""+message.replace("\\","\\\\").replace("\"","\\\"")+"\"}");}
+}
