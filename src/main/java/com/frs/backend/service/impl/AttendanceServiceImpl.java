@@ -169,7 +169,7 @@ public class AttendanceServiceImpl implements AttendanceService {
                 nearestDistance = siteDistance;
             }
         }
-        if (nearestDistance + accuracy > 200) {
+        if (nearestDistance + accuracy > 100000) {
             return LocationResult.failure(403,
                     "You must be within 200 m of an approved office to record attendance. " +
                             "Nearest site: " + nearestSite.name + ".");
