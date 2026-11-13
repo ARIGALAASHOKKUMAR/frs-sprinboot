@@ -3,8 +3,11 @@ package com.frs.backend.config;
 
 import com.frs.backend.repository.FaceTemplateRepository;
 import com.zaxxer.hikari.HikariDataSource;
+
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.core.env.Environment;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.datasource.init.DatabasePopulatorUtils;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
@@ -12,19 +15,28 @@ import org.springframework.boot.CommandLineRunner;
 
 import javax.sql.DataSource;
 import java.nio.file.*;
-import java.util.*;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 
 @Configuration
 public class DatabaseConfig {
 
     private Map<String, String> settings() {
+
         Map<String, String> map = new HashMap<>();
 
+        // Read .env only for local development
         Path dotEnv = Paths.get(".env");
 
         if (Files.exists(dotEnv)) {
             try {
                 for (String line : Files.readAllLines(dotEnv)) {
+
                     String s = line.trim();
 
                     if (s.isEmpty() || s.startsWith("#") || !s.contains("=")) {
@@ -39,121 +51,148 @@ public class DatabaseConfig {
                                     .replaceAll("^[\\\"']|[\\\"']$", "")
                     );
                 }
+
             } catch (Exception ex) {
                 System.err.println("Unable to read .env: " + ex.getMessage());
             }
         }
 
+        // Environment variables override .env values
         System.getenv().forEach(map::put);
 
         return map;
     }
 
     @Bean
-    DataSource dataSource() {
+    @Primary
+    public DataSource dataSource(Environment environment) {
 
         Map<String, String> e = settings();
 
         HikariDataSource ds = new HikariDataSource();
 
-        // Local PostgreSQL configuration
-        String host = e.getOrDefault("PGHOST", "localhost");
+        String databaseUrl = e.get("DATABASE_URL");
+
+        String host = e.get("PGHOST");
         String port = e.getOrDefault("PGPORT", "5432");
-        String database = e.getOrDefault("PGDATABASE", "ashokdb");
+        String database = e.getOrDefault("PGDATABASE", "postgres");
 
-        String user = e.getOrDefault(
-                "PGUSER",
-                "apforestdepartment"
-        );
+        String username = e.get("PGUSER");
+        String password = e.get("PGPASSWORD");
 
-        String password = e.getOrDefault(
-                "PGPASSWORD",
-                ""
-        );
+        // Fallback to Spring Boot properties
+        if (username == null || username.isBlank()) {
+            username = environment.getProperty("spring.datasource.username");
+        }
 
-        // Optional DATABASE_URL support
-        String url = e.get("DATABASE_URL");
+        if (password == null || password.isBlank()) {
+            password = environment.getProperty("spring.datasource.password");
+        }
 
-        if (url != null && !url.isBlank()) {
+        if (databaseUrl != null && !databaseUrl.isBlank()) {
 
-            if (url.startsWith("postgres://") ||
-                    url.startsWith("postgresql://")) {
+            try {
 
-                try {
-                    java.net.URI uri = java.net.URI.create(url);
+                URI uri = URI.create(databaseUrl);
 
-                    String info = uri.getUserInfo();
+                String userInfo = uri.getUserInfo();
 
-                    if (info != null) {
-                        String[] credentials = info.split(":", 2);
+                if (userInfo != null) {
 
-                        user = java.net.URLDecoder.decode(
-                                credentials[0],
-                                java.nio.charset.StandardCharsets.UTF_8
+                    String[] credentials = userInfo.split(":", 2);
+
+                    username = URLDecoder.decode(
+                            credentials[0],
+                            StandardCharsets.UTF_8
+                    );
+
+                    if (credentials.length > 1) {
+                        password = URLDecoder.decode(
+                                credentials[1],
+                                StandardCharsets.UTF_8
                         );
-
-                        if (credentials.length > 1) {
-                            password = java.net.URLDecoder.decode(
-                                    credentials[1],
-                                    java.nio.charset.StandardCharsets.UTF_8
-                            );
-                        }
                     }
-
-                    String db = uri.getPath() == null ? "" : uri.getPath();
-                    String query = uri.getQuery() == null
-                            ? ""
-                            : "?" + uri.getQuery();
-
-                    ds.setJdbcUrl(
-                            "jdbc:postgresql://" +
-                                    uri.getHost() + ":" +
-                                    (uri.getPort() < 0 ? 5432 : uri.getPort()) +
-                                    db + query
-                    );
-
-                } catch (Exception ex) {
-                    throw new IllegalArgumentException(
-                            "Invalid DATABASE_URL", ex
-                    );
                 }
 
-            } else {
+                String db = uri.getPath() == null ? "/postgres" : uri.getPath();
+
+                String query = uri.getQuery() == null
+                        ? ""
+                        : "?" + uri.getQuery();
+
                 ds.setJdbcUrl(
-                        url.startsWith("jdbc:")
-                                ? url
-                                : url.replaceFirst(
-                                "^postgres://",
-                                "jdbc:postgresql://"
-                        )
+                        "jdbc:postgresql://" +
+                                uri.getHost() + ":" +
+                                (uri.getPort() < 0 ? 5432 : uri.getPort()) +
+                                db + query
+                );
+
+            } catch (Exception ex) {
+
+                throw new IllegalArgumentException(
+                        "Invalid DATABASE_URL configuration",
+                        ex
                 );
             }
 
-        } else {
+        } else if (host != null && !host.isBlank()) {
 
+            // Supabase / PostgreSQL environment configuration
             ds.setJdbcUrl(
                     "jdbc:postgresql://" +
                             host + ":" + port +
-                            "/" + database
+                            "/" + database +
+                            "?sslmode=require"
             );
+
+        } else {
+
+            // Use application.properties configuration
+            String springUrl = environment.getProperty(
+                    "spring.datasource.url"
+            );
+
+            if (springUrl == null || springUrl.isBlank()) {
+                throw new IllegalStateException(
+                        "Database URL is missing. Configure DATABASE_URL, PGHOST or spring.datasource.url."
+                );
+            }
+
+            ds.setJdbcUrl(springUrl);
         }
 
-        ds.setUsername(user);
+        if (username == null || username.isBlank()) {
+            throw new IllegalStateException("Database username is missing.");
+        }
+
+        if (password == null || password.isBlank()) {
+            throw new IllegalStateException("Database password is missing.");
+        }
+
+        ds.setUsername(username);
         ds.setPassword(password);
 
-        if ("true".equalsIgnoreCase(e.get("PGSSL"))) {
-            ds.addDataSourceProperty("sslmode", "require");
-        }
+        ds.setDriverClassName("org.postgresql.Driver");
 
-        ds.setMaximumPoolSize(10);
+        ds.setMaximumPoolSize(5);
+        ds.setMinimumIdle(1);
+
+        ds.setConnectionTimeout(30000);
+        ds.setIdleTimeout(600000);
+        ds.setMaxLifetime(1800000);
 
         return ds;
     }
 
     @Bean
-    CommandLineRunner initialize(DataSource ds, FaceTemplateRepository faceTemplates) {
+    public CommandLineRunner initialize(
+            DataSource ds,
+            FaceTemplateRepository faceTemplates
+    ) {
 
         return args -> {
+
+            System.out.println("Initializing database...");
 
             // Initialize database schema
             ResourceDatabasePopulator populator =
@@ -165,6 +204,8 @@ public class DatabaseConfig {
 
             DatabasePopulatorUtils.execute(populator, ds);
 
+            System.out.println("Database schema initialized successfully.");
+
             // Import legacy face descriptor
             Path legacy = Paths.get("../faces.json");
 
@@ -175,6 +216,7 @@ public class DatabaseConfig {
             if (Files.exists(legacy)) {
 
                 try {
+
                     com.fasterxml.jackson.databind.JsonNode root =
                             new com.fasterxml.jackson.databind.ObjectMapper()
                                     .readTree(Files.readString(legacy));
@@ -199,23 +241,36 @@ public class DatabaseConfig {
 
                         values.append('}');
 
-                        Object at = root.hasNonNull("registeredAt")
-                                ? java.sql.Timestamp.from(
-                                java.time.Instant.parse(
-                                        root.get("registeredAt").asText()
-                                )
-                        )
-                                : null;
+                        Timestamp registeredAt =
+                                root.hasNonNull("registeredAt")
+                                        ? Timestamp.from(
+                                                Instant.parse(
+                                                        root.get("registeredAt").asText()
+                                                )
+                                        )
+                                        : null;
 
-                        faceTemplates.importLegacy(values.toString(), (java.sql.Timestamp) at);
+                        faceTemplates.importLegacy(
+                                values.toString(),
+                                registeredAt
+                        );
+
+                        System.out.println(
+                                "Legacy face descriptor imported successfully."
+                        );
                     }
 
                 } catch (Exception ex) {
+
                     System.err.println(
                             "Legacy face descriptor was not imported: " +
                                     ex.getMessage()
                     );
                 }
+
+            } else {
+
+                System.out.println("No legacy faces.json found. Skipping import.");
             }
         };
     }
