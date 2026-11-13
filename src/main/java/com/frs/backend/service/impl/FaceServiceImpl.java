@@ -1,170 +1,238 @@
 package com.frs.backend.service.impl;
 
-import com.frs.backend.dto.FaceImageDto;
-import com.frs.backend.entity.FaceTemplateEntity;
-import com.frs.backend.repository.FaceTemplateRepository;
 import com.frs.backend.service.FaceDescriptorService;
-import com.frs.backend.service.FaceService;
-import org.springframework.http.ResponseEntity;
+
+import jakarta.annotation.PostConstruct;
+
+import nu.pattern.OpenCV;
+
+import org.opencv.core.*;
+import org.opencv.objdetect.FaceDetectorYN;
+import org.opencv.objdetect.FaceRecognizerSF;
+
 import org.springframework.stereotype.Service;
 
-import java.time.Instant;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.io.InputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
 
 @Service
-public class FaceServiceImpl implements FaceService {
-    private static final double MATCH_THRESHOLD = 0.4;
+public class FaceServiceImpl implements FaceDescriptorService {
 
-    private final FaceTemplateRepository templates;
-    private final FaceDescriptorService descriptors;
+    private FaceDetectorYN detector;
+    private FaceRecognizerSF recognizer;
 
-    public FaceServiceImpl(FaceTemplateRepository templates, FaceDescriptorService descriptors) {
-        this.templates = templates;
-        this.descriptors = descriptors;
-    }
+    private volatile boolean loaded = false;
 
-    @Override
-    public ResponseEntity<Map<String, Object>> health() {
-        return ResponseEntity.ok(Map.of(
-                "success", true,
-                "message", "Face Recognition API is running",
-                "modelsLoaded", descriptors.loaded(),
-                "faceRegistered", templates.existsAny(),
-                "endpoints", List.of("POST /api/face/register", "POST /api/face/compare")));
-    }
+    @PostConstruct
+    public void load() {
 
-    @Override
-    public ResponseEntity<Map<String, Object>> status(String employeeId) {
-        List<Map<String, Object>> rows = templates.findRegisteredAt(employeeId);
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("success", true);
-        body.put("registered", !rows.isEmpty());
-        body.put("registeredAt", rows.isEmpty() ? null : rows.get(0).get("registeredAt"));
-        return ResponseEntity.ok(body);
-    }
-
-    @Override
-    public ResponseEntity<Map<String, Object>> register(String employeeId, FaceImageDto body) {
-        if (!descriptors.loaded()) {
-            return modelUnavailable();
-        }
         try {
-            double[] descriptor = descriptors.descriptor(Objects.toString(body.image(), null));
-            StringBuilder array = new StringBuilder("{");
-            for (int i = 0; i < descriptor.length; i++) {
-                if (i > 0) {
-                    array.append(',');
-                }
-                array.append(Double.toString(descriptor[i]));
-            }
-            array.append('}');
-            Instant now = Instant.now();
-            Double[] storedDescriptor = new Double[descriptor.length];
-            for (int i = 0; i < descriptor.length; i++) {
-                storedDescriptor[i] = descriptor[i];
-            }
-            templates.save(new FaceTemplateEntity(employeeId, storedDescriptor, now));
-            return ResponseEntity.ok(Map.of("success", true,
-                    "message", "Face registered successfully", "registeredAt", now.toString()));
-        } catch (Exception exception) {
-            return ResponseEntity.badRequest().body(Map.of("success", false, "message",
-                    Objects.toString(exception.getMessage(), "Face registration failed")));
+
+            OpenCV.loadLocally();
+
+            String detectorPath = extractModel(
+                "/models/face_detection_yunet_2023mar.onnx"
+            );
+
+            String recognizerPath = extractModel(
+                "/models/face_recognition_sface_2021dec.onnx"
+            );
+
+            detector = FaceDetectorYN.create(
+                detectorPath,
+                "",
+                new Size(320, 320),
+                0.9f,
+                0.3f,
+                5000
+            );
+
+            recognizer = FaceRecognizerSF.create(
+                recognizerPath,
+                ""
+            );
+
+            loaded = detector != null && recognizer != null;
+
+            System.out.println(
+                "Face recognition models loaded: " + loaded
+            );
+
+        } catch (Exception e) {
+
+            loaded = false;
+
+            System.err.println(
+                "Face model initialization failed: " + e.getMessage()
+            );
+
+            e.printStackTrace();
         }
     }
 
-   
-@Override
-public ResponseEntity<Map<String, Object>> compare(
-        String employeeId, FaceImageDto body) {
+    private String extractModel(String resourcePath) throws IOException {
 
-    if (!descriptors.loaded()) {
-        return modelUnavailable();
-    }
+        try (InputStream input =
+                 getClass().getResourceAsStream(resourcePath)) {
 
-    try {
-        var registered = templates.findById(employeeId);
-
-        if (registered.isEmpty()) {
-            return ResponseEntity.badRequest().body(Map.of(
-                    "success", false,
-                    "matched", false,
-                    "message", "No registered face found. Please register first."
-            ));
-        }
-
-        Double[] stored = registered.get().getDescriptor();
-
-        if (stored == null || stored.length != 128) {
-            return ResponseEntity.badRequest().body(Map.of(
-                    "success", false,
-                    "matched", false,
-                    "message", "Invalid registered face descriptor."
-            ));
-        }
-
-        double[] storedDescriptor = new double[stored.length];
-
-        for (int i = 0; i < stored.length; i++) {
-            if (stored[i] == null || !Double.isFinite(stored[i])) {
-                throw new IllegalArgumentException(
-                        "Invalid value in registered face descriptor.");
+            if (input == null) {
+                throw new IOException(
+                    "Model not found: " + resourcePath
+                );
             }
 
-            storedDescriptor[i] = stored[i];
+            String fileName = resourcePath.substring(
+                resourcePath.lastIndexOf('/') + 1
+            );
+
+            Path tempFile = Files.createTempFile(
+                "frs-", "-" + fileName
+            );
+
+            Files.copy(
+                input,
+                tempFile,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING
+            );
+
+            tempFile.toFile().deleteOnExit();
+
+            return tempFile.toAbsolutePath().toString();
+        }
+    }
+
+    @Override
+    public boolean loaded() {
+        return loaded;
+    }
+
+    @Override
+    public double[] descriptor(String input) throws Exception {
+
+        if (!loaded) {
+            throw new IllegalStateException(
+                "Face recognition models are not loaded"
+            );
         }
 
-        double[] capturedDescriptor =
-                descriptors.descriptor(body.image());
-
-        if (capturedDescriptor == null ||
-                capturedDescriptor.length != 128) {
+        if (input == null || input.isBlank()) {
             throw new IllegalArgumentException(
-                    "Invalid captured face descriptor.");
+                "Face image is required"
+            );
         }
 
-        double distance = FaceDescriptorService.distance(
-                storedDescriptor,
-                capturedDescriptor
+        String base64 = input.replaceFirst(
+            "^data:image/[A-Za-z0-9.+-]+;base64,",
+            ""
         );
 
-        if (!Double.isFinite(distance)) {
-            throw new IllegalArgumentException(
-                    "Invalid face comparison distance.");
+        byte[] imageBytes;
+
+        try {
+            imageBytes = Base64.getDecoder().decode(base64);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid image data");
         }
 
-        boolean matched = distance < MATCH_THRESHOLD;
+        if (imageBytes.length == 0) {
+            throw new IllegalArgumentException("Invalid image data");
+        }
 
-        Map<String, Object> response = new LinkedHashMap<>();
+        Mat image = org.opencv.imgcodecs.Imgcodecs.imdecode(
+            new MatOfByte(imageBytes),
+            org.opencv.imgcodecs.Imgcodecs.IMREAD_COLOR
+        );
 
-        response.put("success", true);
-        response.put("matched", matched);
-        response.put("distance",
-                Math.round(distance * 10000.0) / 10000.0);
-        response.put("threshold", MATCH_THRESHOLD);
-        response.put("message", matched
-                ? "Face matched successfully"
-                : "Face does not match");
+        if (image.empty()) {
+            throw new IllegalArgumentException(
+                "Unable to read face image"
+            );
+        }
 
-        return ResponseEntity.ok(response);
+        try {
 
-    } catch (Exception exception) {
-        exception.printStackTrace();
+            detector.setInputSize(
+                new Size(image.cols(), image.rows())
+            );
 
-        return ResponseEntity.badRequest().body(Map.of(
-                "success", false,
-                "matched", false,
-                "message", Objects.toString(
-                        exception.getMessage(),
-                        "Face comparison failed")
-        ));
-    }
-}
+            Mat faces = new Mat();
 
-    private static ResponseEntity<Map<String, Object>> modelUnavailable() {
-        return ResponseEntity.status(503).body(Map.of(
-                "success", false, "message", "Face recognition models are not loaded yet."));
+            detector.detect(image, faces);
+
+            if (faces.empty() || faces.rows() == 0) {
+                throw new IllegalArgumentException(
+                    "No face detected. Please capture a clear face image."
+                );
+            }
+
+            // Select the face with the highest detection confidence.
+            int bestIndex = 0;
+            double bestConfidence = -1;
+
+            for (int i = 0; i < faces.rows(); i++) {
+
+                double[] values = faces.get(i, 0);
+
+                if (values != null && values.length >= 15) {
+
+                    double confidence = values[14];
+
+                    if (confidence > bestConfidence) {
+                        bestConfidence = confidence;
+                        bestIndex = i;
+                    }
+                }
+            }
+
+            Mat face = faces.row(bestIndex);
+
+            Mat alignedFace = new Mat();
+
+            recognizer.alignCrop(
+                image,
+                face,
+                alignedFace
+            );
+
+            Mat feature = new Mat();
+
+            recognizer.feature(
+                alignedFace,
+                feature
+            );
+
+            if (feature.empty()) {
+                throw new IllegalStateException(
+                    "Unable to generate face descriptor"
+                );
+            }
+
+            int total = (int) (feature.total() * feature.channels());
+
+            double[] descriptor = new double[total];
+
+            float[] featureValues = new float[total];
+
+            feature.get(0, 0, featureValues);
+
+            for (int i = 0; i < total; i++) {
+                descriptor[i] = featureValues[i];
+            }
+
+            if (descriptor.length != 128) {
+                throw new IllegalStateException(
+                    "Unexpected face descriptor size: " +
+                    descriptor.length
+                );
+            }
+
+            return descriptor;
+
+        } finally {
+            image.release();
+        }
     }
 }
